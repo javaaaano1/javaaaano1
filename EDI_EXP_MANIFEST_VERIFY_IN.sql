@@ -245,6 +245,415 @@ create or replace package body EDI_EXP_MANIFEST_VERIFY_IN is
     end if;
     
   end verifyCargoInfo;
+
+  /**
+   ** 山东提单核对
+   */
+  procedure verifyInfoSD(pi_imfi_id   in varchar2,
+                          pi_exp_id    in varchar2,
+                          po_message   out varchar2,
+                          data_code in varchar2,
+                          pi_bl_no in varchar2,
+                          pi_org_id in varchar2,
+                          pi_user_id in varchar2)is
+    l_cntRow     imanifestincontainer%rowtype;
+    l_cnt_id     scontainerinfo.spci_packing_list_id%type;
+    l_cnt_no     scontainerinfo.spci_cnt_no%type;
+    l_seal_no    scontainerinfo.spci_seal_no%type;
+    l_seal_no2   scontainerinfo.spci_seal_no2%type;
+    l_seal_no3   scontainerinfo.spci_seal_no3%type;
+    l_quantity   scontainerinfo.spci_quantity%type;
+    l_weight     scontainerinfo.spci_weight%type;
+    f_seal_no    scontainerinfo.spci_seal_no%type;
+    l_measurement    scontainerinfo.spci_measurement%type;
+    f_i_seal_no    imanifestinseal.imsi_seal_no%type;
+    l_i_description    imanifestincargo.imai_cargo_description%type;
+    l_description    scargoinfo.spgi_cargo_description_en%type;
+
+    l_count_seal int:= 0;
+    l_i_seal_count int := 0;
+    l_seal_count   int := 0;
+    l_cargo_verify_count  int:= 0;
+
+  if data_code is not null then
+    l_ctn_nos      clob;
+    cursor cur_icnt is
+      select imti.imti_id,imti.imti_container_no,
+           imti.imti_ctn_package_number,imti.imti_cargo_net_weight,imti.imti_cargo_measurement
+      from imanifestincontainer imti
+      where imti.imti_pid = pi_imfi_id;
+    begin
+      select f_link_lob(s.spci_cnt_no)
+        into l_ctn_nos
+      from scontainerinfo s
+      where s.spci_exp_bl_id = pi_exp_id
+        and not exists(select 0 from imanifestincontainer i
+                     where i.imti_pid = pi_imfi_id and s.spci_cnt_no = i.imti_container_no);
+
+    if l_ctn_nos is not null then
+          po_message := l_ctn_nos || '箱号不一致';
+    return;
+    end if;
+
+    if (INSTR(data_code,"SPGI_CARGO_DESCRIPTION_EN") > 0) then
+        select count(0),imai.imai_cargo_description,spgi.spgi_cargo_description_en
+            into l_cargo_verify_count,l_i_description,l_description
+        from imanifestincargo imai,scargoinfo spgi
+            where imai.imai_pid = pi_imfi_id
+             and spgi.spgi_exp_bl_id = pi_exp_id
+             and spgi.spgi_record_type = '0'
+             and (SYS.UTL_MATCH.edit_distance_similarity(substr(upper(spgi.spgi_cargo_description_en),1,10),
+                                                      substr(upper(imai.imai_cargo_description),1,10)) >= 80
+             or instr(replace(replace(upper(spgi.spgi_cargo_description_en),chr(10),' '),' ',''),
+                     substr(replace(replace(upper(imai.imai_cargo_description),chr(10),' '),' ',''),1,10)) > 0);
+
+        if l_cargo_verify_count = 0 then
+            select imai.imai_cargo_description
+              into l_i_description
+              from imanifestincargo imai
+            where imai.imai_pid = pi_imfi_id
+            select spgi.spgi_cargo_description_en
+              into l_description
+              from scargoinfo spgi
+            where spgi.spgi_exp_bl_id = pi_exp_id
+              and spgi.spgi_record_type = '0';
+            insert into sbcheckresult(sbcr_id,
+                                      sbcr_bl_id,
+                                      sbcr_imfi_id,
+                                      sbcr_bl_no,
+                                      sbcr_cnt_no,
+                                      sbcr_data,
+                                      sbcr_mf_value,
+                                      sbcr_bl_value,
+                                      sbcr_check_flag,
+                                      sbcr_org_id,
+                                      sbcr_creator,
+                                      sbcr_create_time)
+            values (seq_sbcr_id.nextval,
+                    pi_exp_id,
+                    pi_imfi_id,
+                    pi_bl_no,
+                    l_cnt_no,
+                    "品名",
+                    l_description,
+                    l_i_description,
+                    "Y",
+                    pi_org_id,
+                    pi_user_id,
+                    sysdate);
+        else
+            insert into sbcheckresult(sbcr_id,
+                                      sbcr_bl_id,
+                                      sbcr_imfi_id,
+                                      sbcr_bl_no,
+                                      sbcr_cnt_no,
+                                      sbcr_data,
+                                      sbcr_mf_value,
+                                      sbcr_bl_value,
+                                      sbcr_check_flag,
+                                      sbcr_org_id,
+                                      sbcr_creator,
+                                      sbcr_create_time)
+            values (seq_sbcr_id.nextval,
+                    pi_exp_id,
+                    pi_imfi_id,
+                    pi_bl_no,
+                    l_cnt_no,
+                    "品名",
+                    l_description,
+                    l_i_description,
+                    "N",
+                    pi_org_id,
+                    pi_user_id,
+                    sysdate);
+
+        end if;
+    end if;
+
+    open cur_icnt;
+        loop
+            fetch cur_icnt
+             into l_cntRow.Imti_Id,l_cntRow.Imti_Container_No,
+                 l_cntRow.Imti_Ctn_Package_Number,l_cntRow.Imti_Cargo_Net_Weight,l_cntRow.Imti_Cargo_Measurement;
+        exit when cur_icnt%notfound;
+        l_count_seal   := 0;
+        l_i_seal_count := 0;
+        l_seal_count   := 0;
+    begin
+        select s.spci_packing_list_id ,s.spci_cnt_no,s.spci_seal_no,s.spci_quantity,s.spci_weight,
+            s.spci_seal_no2,s.spci_seal_no3,s.spci_measurement
+        into l_cnt_id,l_cnt_no,l_seal_no,l_quantity,l_weight,l_seal_no2,l_seal_no3,l_measurement
+        from scontainerinfo s
+        where s.spci_exp_bl_id = pi_exp_id
+          and s.spci_cnt_no = l_cntRow.Imti_Container_No
+          and rownum = 1;
+        exception
+           when no_data_found then
+             null;
+           end;
+        if l_cnt_id is null then -- 无箱号，问题提单，备注信息
+             po_message := l_cntRow.Imti_Container_No||'箱子系统无';
+        else
+            if l_seal_no is not null then
+                l_seal_count := l_seal_count + 1
+                f_seal_no = l_seal_no;
+        end if;
+
+        if l_seal_no2 is not null then
+           l_seal_count := l_seal_count + 1;
+            f_seal_no = l_seal_no2;
+        end if;
+        if l_seal_no3 is not null then
+           l_seal_count := l_seal_count + 1;
+            f_seal_no = l_seal_no3;
+        end if;
+
+        select count(0)
+          into l_i_seal_count
+          from imanifestinseal i
+          where i.imsi_pid = l_cntRow.Imti_Id;
+
+        if l_i_seal_count > 0 and l_seal_count = l_i_seal_count  then --HY3-816
+            select count(0),i.imsi_seal_no
+            into l_count_seal,f_i_seal_no
+            from imanifestinseal i
+            where i.imsi_pid = l_cntRow.Imti_Id
+              and (i.imsi_seal_no = l_seal_no or i.imsi_seal_no = l_seal_no2
+              or i.imsi_seal_no = l_seal_no3);
+        elsif l_i_seal_count = 0 and l_seal_count > 0 then
+             l_i_seal_count := 1;
+        end if;
+
+        if l_i_seal_count <> l_count_seal or l_quantity <> l_cntRow.Imti_Ctn_Package_Number
+             or l_cntRow.Imti_Cargo_Net_Weight <> l_weight then
+             po_message := substrb(l_cntRow.Imti_Container_No ||'铅封号/件数/毛重不一致;'|| po_message,1,1000);
+        end if;
+
+        if(INSTR(data_code,"SPCI_SEAL_NO") > 0) then
+            if l_i_seal_count <> l_count_seal then
+                insert into sbcheckresult(sbcr_id,
+                                          sbcr_bl_id,
+                                          sbcr_imfi_id,
+                                          sbcr_bl_no,
+                                          sbcr_cnt_no,
+                                          sbcr_data,
+                                          sbcr_mf_value,
+                                          sbcr_bl_value,
+                                          sbcr_check_flag,
+                                          sbcr_org_id,
+                                          sbcr_creator,
+                                          sbcr_create_time)
+                values (seq_sbcr_id.nextval,
+                        pi_exp_id,
+                        pi_imfi_id,
+                        pi_bl_no,
+                        l_cnt_no,
+                        "封号",
+                        f_seal_no,
+                        f_i_seal_no,
+                        "Y",
+                        pi_org_id,
+                        pi_user_id,
+                        sysdate);
+                else
+                insert into sbcheckresult(sbcr_id,
+                                          sbcr_bl_id,
+                                          sbcr_imfi_id,
+                                          sbcr_bl_no,
+                                          sbcr_cnt_no,
+                                          sbcr_data,
+                                          sbcr_mf_value,
+                                          sbcr_bl_value,
+                                          sbcr_check_flag,
+                                          sbcr_org_id,
+                                          sbcr_creator,
+                                          sbcr_create_time)
+                values (seq_sbcr_id.nextval,
+                        pi_exp_id,
+                        pi_imfi_id,
+                        pi_bl_no,
+                        l_cnt_no,
+                        "封号",
+                        f_seal_no,
+                        f_i_seal_no,
+                        "N",
+                        pi_org_id,
+                        pi_user_id,
+                        sysdate);
+            end if;
+        end if;
+
+        if(INSTR(data_code,"SPCI_MEASUREMENT") > 0) then
+            if l_cntRow.Imti_Cargo_Measurement <> l_measurement then
+                insert into sbcheckresult(sbcr_id,
+                                          sbcr_bl_id,
+                                          sbcr_imfi_id,
+                                          sbcr_bl_no,
+                                          sbcr_cnt_no,
+                                          sbcr_data,
+                                          sbcr_mf_value,
+                                          sbcr_bl_value,
+                                          sbcr_check_flag,
+                                          sbcr_org_id,
+                                          sbcr_creator,
+                                          sbcr_create_time)
+                values (seq_sbcr_id.nextval,
+                        pi_exp_id,
+                        pi_imfi_id,
+                        pi_bl_no,
+                        l_cnt_no,
+                        "体积",
+                        l_measurement,
+                        l_cntRow.Imti_Cargo_Measurement,
+                        "Y",
+                        pi_org_id,
+                        pi_user_id,
+                        sysdate);
+                else
+                insert into sbcheckresult(sbcr_id,
+                                          sbcr_bl_id,
+                                          sbcr_imfi_id,
+                                          sbcr_bl_no,
+                                          sbcr_cnt_no,
+                                          sbcr_data,
+                                          sbcr_mf_value,
+                                          sbcr_bl_value,
+                                          sbcr_check_flag,
+                                          sbcr_org_id,
+                                          sbcr_creator,
+                                          sbcr_create_time)
+                values (seq_sbcr_id.nextval,
+                        pi_exp_id,
+                        pi_imfi_id,
+                        pi_bl_no,
+                        l_cnt_no,
+                        "体积",
+                        l_measurement,
+                        l_cntRow.Imti_Cargo_Measurement,
+                        "N",
+                        pi_org_id,
+                        pi_user_id,
+                        sysdate);
+            end if;
+        end if;
+
+        if(INSTR(data_code,"SPCI_WEIGHT") > 0) then
+            if l_cntRow.Imti_Cargo_Net_Weight <> l_weight then
+                insert into sbcheckresult(sbcr_id,
+                                          sbcr_bl_id,
+                                          sbcr_imfi_id,
+                                          sbcr_bl_no,
+                                          sbcr_cnt_no,
+                                          sbcr_data,
+                                          sbcr_mf_value,
+                                          sbcr_bl_value,
+                                          sbcr_check_flag,
+                                          sbcr_org_id,
+                                          sbcr_creator,
+                                          sbcr_create_time)
+                values (seq_sbcr_id.nextval,
+                        pi_exp_id,
+                        pi_imfi_id,
+                        pi_bl_no,
+                        l_cnt_no,
+                        "重量",
+                        l_weight,
+                        l_cntRow.Imti_Cargo_Net_Weight,
+                        "Y",
+                        pi_org_id,
+                        pi_user_id,
+                        sysdate);
+                else
+                insert into sbcheckresult(sbcr_id,
+                                          sbcr_bl_id,
+                                          sbcr_imfi_id,
+                                          sbcr_bl_no,
+                                          sbcr_cnt_no,
+                                          sbcr_data,
+                                          sbcr_mf_value,
+                                          sbcr_bl_value,
+                                          sbcr_check_flag,
+                                          sbcr_org_id,
+                                          sbcr_creator,
+                                          sbcr_create_time)
+                values (seq_sbcr_id.nextval,
+                        pi_exp_id,
+                        pi_imfi_id,
+                        pi_bl_no,
+                        l_cnt_no,
+                        "重量",
+                        l_weight,
+                        l_cntRow.Imti_Cargo_Net_Weight,
+                        "N",
+                        pi_org_id,
+                        pi_user_id,
+                        sysdate);
+
+            end if;
+        end if;
+
+        if (INSTR(data_code,"SPCI_QUANTITY") > 0) then
+          if l_quantity <> l_cntRow.Imti_Ctn_Package_Number then
+            insert into sbcheckresult(sbcr_id,
+                                      sbcr_bl_id,
+                                      sbcr_imfi_id,
+                                      sbcr_bl_no,
+                                      sbcr_cnt_no,
+                                      sbcr_data,
+                                      sbcr_mf_value,
+                                      sbcr_bl_value,
+                                      sbcr_check_flag,
+                                      sbcr_org_id,
+                                      sbcr_creator,
+                                      sbcr_create_time)
+                values (seq_sbcr_id.nextval,
+                        pi_exp_id,
+                        pi_imfi_id,
+                        pi_bl_no,
+                        l_cnt_no,
+                        "件数",
+                        l_quantity,
+                        l_cntRow.Imti_Ctn_Package_Number,
+                        "Y",
+                        pi_org_id,
+                        pi_user_id,
+                        sysdate);
+            else
+                insert into sbcheckresult(sbcr_id,
+                          sbcr_bl_id,
+                          sbcr_imfi_id,
+                          sbcr_bl_no,
+                          sbcr_cnt_no,
+                          sbcr_data,
+                          sbcr_mf_value,
+                          sbcr_bl_value,
+                          sbcr_check_flag,
+                          sbcr_org_id,
+                          sbcr_creator,
+                          sbcr_create_time)
+                values (seq_sbcr_id.nextval,
+                          pi_exp_id,
+                          pi_imfi_id,
+                          pi_bl_no,
+                          l_cnt_no,
+                          "件数",
+                          l_quantity,
+                          l_cntRow.Imti_Ctn_Package_Number,
+                          "N",
+                          pi_org_id,
+                          pi_user_id,
+                          sysdate);
+            end if;
+        end if;
+
+        end if;
+        end loop;
+
+        close cur_icnt;
+
+    end if
+  end verifyInfoSD;
+
   /*
   ** 船代出口签单核对导入
   **/
@@ -259,11 +668,14 @@ create or replace package body EDI_EXP_MANIFEST_VERIFY_IN is
     l_doc_status sexportmanifest.ssem_document_status%type;
     l_release_type sexportmanifest.ssem_release_bl_type%type;
     l_release_memo sexportmanifest.ssem_release_bl_memo%type;
-    
+    l_carrier_id sexportmanifest.ssem_carrier_id%type;
+
     l_upd_release_type imanifestin.imfi_bl_send_mode_code%type;
     l_upd_doc_status   sexportmanifest.ssem_document_status%type;
     l_upd_release_memo sexportmanifest.ssem_release_bl_memo%type;
-    
+    data_code sblcheckconfig.sbcc_data_code%type;
+    l_bl_no sexportmanifest.ssem_bl_no;
+
     l_message    varchar2(1000);
     l_vessel_count int := 0;
     
@@ -332,13 +744,27 @@ create or replace package body EDI_EXP_MANIFEST_VERIFY_IN is
          可放单                   5 */
       select sef.ssem_document_status,
              sef.ssem_release_bl_type,
-             sef.ssem_release_bl_memo
-        into l_doc_status ,l_release_type,l_release_memo
+             sef.ssem_release_bl_memo,
+             sef.ssem_carrier_id,
+             sef.ssem_bl_no
+        into l_doc_status ,l_release_type,l_release_memo,l_carrier_id,l_bl_no
         from sexportmanifest sef
        where sef.ssem_exp_bl_id = l_exp_bl_id;
-      if l_doc_status = 0 or l_doc_status = '5' then --0未放单 5可放单 
+
+      select sbcc_data_code into data_code
+        from sblcheckconfig sbc
+        where sbc.sbcc_carrier = l_carrier_id
+        and sbcc_cancel_flag = 'Y'
+        and sbcc_org_id = pi_org_id;
+
+      if l_doc_status = 0 or l_doc_status = '5' then --0未放单 5可放单
+        if pi_org_id = '139' then
+        verifyInfoSD(l_imfRow.Imfi_Id,l_exp_bl_id,l_message,data_code,l_bl_no,pi_org_id,pi_user_id);
+        verifyCargoInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
+        else
         verifyCntInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
         verifyCargoInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
+        end if;
 
         if l_message is null then
           l_upd_doc_status := 5;--核对无差异，变更为可放单
@@ -366,9 +792,14 @@ create or replace package body EDI_EXP_MANIFEST_VERIFY_IN is
           updateImfiDipose(l_imfRow.Imfi_Id,'D',l_message);
         end if;
         handleManifest(l_exp_bl_id,pi_user_id,l_upd_doc_status,l_upd_release_type,l_upd_release_memo);
-      elsif l_doc_status = 4 then --问题提单        
+      elsif l_doc_status = 4 then --问题提单
+        if pi_org_id = '139' then
+        verifyInfoSD(l_imfRow.Imfi_Id,l_exp_bl_id,l_message,data_code,l_bl_no,pi_org_id,pi_user_id);
+        verifyCargoInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
+        else
         verifyCntInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
         verifyCargoInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
+        end if;
         if l_message is null then
           l_upd_doc_status := 4;--核对无差异，变更为可放单 HY3-1804 如果该提单是问题提单，即使MSC更新后跟海运系统比对正确，也不更新状态为可放单。
           l_message := '核对无差异，可放单';
@@ -397,9 +828,14 @@ create or replace package body EDI_EXP_MANIFEST_VERIFY_IN is
         end if;
         handleManifest(l_exp_bl_id,pi_user_id,l_upd_doc_status,l_upd_release_type,l_upd_release_memo);
       elsif l_doc_status = 3 then --已放单
-         verifyCntInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
-         verifyCargoInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
-        if l_message is null and (l_imfRow.Imfi_Bl_Send_Mode_Code = l_release_type 
+        if pi_org_id = '139' then
+        verifyInfoSD(l_imfRow.Imfi_Id,l_exp_bl_id,l_message,data_code,l_bl_no,pi_org_id,pi_user_id);
+        verifyCargoInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
+        else
+        verifyCntInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
+        verifyCargoInfo(l_imfRow.Imfi_Id,l_exp_bl_id,l_message);
+        end if;
+        if l_message is null and (l_imfRow.Imfi_Bl_Send_Mode_Code = l_release_type
             or l_imfRow.Imfi_Bl_Send_Mode_Code is null) then
           l_message := '已放单提单核对无差异';
           updateImfiDipose(l_imfRow.Imfi_Id,'Y',l_message);
