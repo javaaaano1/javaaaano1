@@ -651,7 +651,7 @@ create or replace package body EDI_EXP_MANIFEST_VERIFY_IN is
 
         close cur_icnt;
 
-    end if
+    end if;
   end verifyInfoSD;
 
   /*
